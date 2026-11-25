@@ -1,0 +1,6 @@
+# Aktivira se preko @ActiveProfiles("test") u integracionim testovima. Datasource podesava
+# Testcontainers (@ServiceConnection) — ovde se dodaje samo posebna Flyway lokacija sa
+# deterministickim seed podacima namenjenim iskljucivo testovima (src/test/resources/db/test).
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/test

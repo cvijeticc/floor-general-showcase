@@ -1,0 +1,5 @@
+# Aktivan podrazumevano (spring.profiles.default=dev u application.yml) dok ne postoji pravi prod.
+# Dodaje seed podatke za lokalni rad preko posebne Flyway lokacije — nikad se ne pakuje u prod bazu.
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/dev

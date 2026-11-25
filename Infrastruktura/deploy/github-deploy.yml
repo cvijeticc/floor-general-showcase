@@ -1,0 +1,159 @@
+# Produkcijski build i deploy. U ovom javnom repou je samo kao primer: fajl nije u
+# .github/workflows, pa ga GitHub nikad ne pokrece. Radi u privatnom repou projekta, gde
+# vars.DEPLOY_INSTANCE_ID i vars.AWS_DEPLOY_ROLE_ARN pokazuju na instancu i rolu iz
+# Infrastruktura/github-oidc.tf.
+#
+name: Build i deploy na produkciju
+
+# Samo master -- OIDC trust policy u AWS-u (github-oidc.tf) prihvata token
+# iskljucivo sa ove grane, pa bi pokretanje sa druge svakako palo na AssumeRole.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  INSTANCE_ID: ${{ vars.DEPLOY_INSTANCE_ID }}
+  AWS_REGION: eu-central-1
+
+jobs:
+  # Gradi se samo servis koji ima Dockerfile -- frontend jos ne postoji, a
+  # build bez njega ne sme da padne. Kad stigne Aplikacija/frontend/Dockerfile,
+  # sam ulazi u build i deploy.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.d.outputs.matrix }}
+      services: ${{ steps.d.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: d
+        run: |
+          svcs=""
+          for s in backend frontend; do
+            [ -f "Aplikacija/$s/Dockerfile" ] && svcs="$svcs $s"
+          done
+          svcs="${svcs# }"
+          echo "services=$svcs" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -cn --arg s "$svcs" '{service: ($s | split(" ") | map(select(. != "")))}')" >> "$GITHUB_OUTPUT"
+          echo "Servisi za build: ${svcs:-nijedan}"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.services != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Produkcija je Graviton (ARM64). Runner je x86, pa se ARM imidz gradi
+      # kroz QEMU emulaciju -- sporije, ali radi svuda.
+      # Ako build postane prespor: GitHub nudi native `ubuntu-24.04-arm`
+      # runnere (za privatne repoe se naplacuju) -- tada se QEMU korak brise.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build i push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: Aplikacija/${{ matrix.service }}
+          # KLJUCNO: bez ovoga se gradi x86 imidz koji se na masini povuce bez
+          # greske, a onda kontejner odmah crkne uz "exec format error".
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/floor-general-${{ matrix.service }}:latest
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/floor-general-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # bez ovoga nema OIDC tokena za AWS
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nijedan AWS kljuc ne postoji u repou -- GitHub se predstavlja OIDC
+      # tokenom, a rola prima samo tokene sa ovog repoa i ove grane.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Pokreni deploy na instanci
+        id: send
+        env:
+          SERVICES: ${{ needs.detect.outputs.services }}
+        run: |
+          # Infrastruktura/deploy/ je izvor istine: compose i nginx se prepisuju
+          # pri svakom deployu. Nginx se reload-uje tek posle `nginx -t`; ako test
+          # padne, vraca se prethodni konfig i deploy staje.
+          COMPOSE_B64=$(base64 -w0 Infrastruktura/deploy/docker-compose.yml)
+          NGINX_B64=$(base64 -w0 Infrastruktura/deploy/nginx/floor-general.conf)
+          NGINX_CONF=/etc/nginx/sites-available/floor-general
+          # Jedan sertifikat za sslip.io + floorgeneral.rs + www.
+          # Ako mu nedostaje domen, certbot ga prosiri odmah posle novog nginx-a (webroot:
+          # HTTP-01 ide na port 80, gde nginx sluzi /.well-known/acme-challenge/ iz /var/www/html).
+          # Kad certbot padne (npr. DNS ne pokazuje na nas), vraca se stari nginx i deploy staje,
+          # jer bi inace sslip.io slao na www bez vazeceg sertifikata.
+          # `certonly` ne dira nginx fajl; --deploy-hook ostaje u renewal konfigu, pa obnova
+          # (certbot timer) sama reload-uje nginx. Kad sertifikat vec pokriva domen, korak se preskace.
+          LE_LIVE=/etc/letsencrypt/live/63-187-111-51.sslip.io
+
+          # AWS-RunShellScript izvrsava kroz dash -- zato `set -eu` bez pipefail.
+          PARAMS=$(jq -cn --arg s "$SERVICES" --arg c "$COMPOSE_B64" --arg n "$NGINX_B64" --arg nc "$NGINX_CONF" --arg le "$LE_LIVE" '{commands: [
+            "set -eu",
+            "cd /data/srv/floor-general",
+            "echo \($c) | base64 -d > docker-compose.yml && chown ubuntu:ubuntu docker-compose.yml",
+            "cp \($nc) /tmp/fg-nginx.bak",
+            "echo \($n) | base64 -d > \($nc)",
+            "if nginx -t 2>/tmp/fg-nginx-t.log; then systemctl reload nginx; else cat /tmp/fg-nginx-t.log; cp /tmp/fg-nginx.bak \($nc); exit 1; fi",
+            "mkdir -p /var/www/html",
+            "if openssl x509 -in \($le)/cert.pem -noout -ext subjectAltName | grep -q DNS:www.floorgeneral.rs; then echo sertifikat-ok; elif ! certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos --cert-name 63-187-111-51.sslip.io --expand -d 63-187-111-51.sslip.io -d floorgeneral.rs -d www.floorgeneral.rs --deploy-hook \"systemctl reload nginx\"; then cp /tmp/fg-nginx.bak \($nc); systemctl reload nginx; exit 1; fi",
+            "ssm-env floor-general",
+            "sudo -u ubuntu docker compose pull \($s)",
+            "sudo -u ubuntu docker compose up -d \($s)",
+            "sudo -u ubuntu docker compose ps",
+            "docker image prune -f"
+          ]}')
+          CMD=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}: $SERVICES" \
+            --parameters "$PARAMS" \
+            --query Command.CommandId --output text)
+          echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
+          echo "CommandId: $CMD"
+
+      # send-command je asinhron: bez cekanja workflow bi bio zelen i kad
+      # deploy padne na masini.
+      - name: Sacekaj i prikazi rezultat
+        run: |
+          CMD="${{ steps.send.outputs.cmd }}"
+          aws ssm wait command-executed --command-id "$CMD" --instance-id "$INSTANCE_ID" || true
+
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$INSTANCE_ID" --query Status --output text)
+          echo "--- stdout ---"
+          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text
+          echo "--- stderr ---"
+          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text
+
+          echo "Status: $STATUS"
+          [ "$STATUS" = "Success" ] || exit 1

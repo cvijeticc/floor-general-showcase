@@ -1,0 +1,18 @@
+# Samo dev baza. Test baza se NE drzi ovde — dize se sama, efemerno, preko Testcontainers-a
+# pri pokretanju integracionih testova (videti AbstractIntegrationTest), da dev i test podaci
+# nikad ne budu u istoj instanci Postgresa.
+services:
+  postgres-dev:
+    image: postgres:16
+    container_name: floor-general-postgres-dev
+    environment:
+      POSTGRES_DB: floorgeneral_dev
+      POSTGRES_USER: floorgeneral
+      POSTGRES_PASSWORD: floorgeneral
+    ports:
+      - "55432:5432"
+    volumes:
+      - floor-general-dev-pgdata:/var/lib/postgresql/data
+
+volumes:
+  floor-general-dev-pgdata:

@@ -1,0 +1,83 @@
+# Produkcijski stack Floor General lige. Zivi na instanci u
+# /data/srv/floor-general/, a izvor istine je ovaj fajl u repou.
+#
+# nginx NIJE ovde -- radi na hostu (instaliran bootstrap-om) i proksira na
+# portove ispod. Tako certbot barata sertifikatima bez restarta stacka.
+name: floor-general
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # Vezan SAMO na loopback: baza nema nikakav put sa interneta, a security
+    # group ionako nema ingress pravilo za 5432.
+    ports:
+      - "127.0.0.1:5432:5432"
+    env_file:
+      - /data/secrets/floor-general.env
+    volumes:
+      - /data/srv/floor-general/pgdata:/var/lib/postgresql/data
+    # Tuning za 8GB masinu na kojoj zive jos JVM i Next.js: bazi dajemo oko
+    # 1/8 RAM-a za shared_buffers, a effective_cache_size je samo procena za
+    # planer (ne alocira memoriju).
+    command: >
+      postgres
+      -c shared_buffers=768MB
+      -c effective_cache_size=2560MB
+      -c maintenance_work_mem=128MB
+      -c work_mem=8MB
+      -c max_connections=100
+      -c random_page_cost=1.1
+      -c log_min_duration_statement=1000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: &default_logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend:
+    # ARM64 imidz -- GitHub Actions ga gradi kroz buildx (vidi .github/workflows).
+    image: ghcr.io/cvijeticc/floor-general-backend:latest
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - /data/secrets/floor-general.env
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # Kontejner ne vidi 127.0.0.1 hosta -- ide preko compose mreze.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-floor_general}
+      # Bez -Xmx JVM u kontejneru uzima 1/4 RAM-a i raste; ovako je predvidivo.
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=50 -XX:+UseSerialGC"
+      # Link ka /admin/prijave u mejlu o novoj prijavi (app.mail.site-url).
+      SITE_URL: https://www.floorgeneral.rs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default_logging
+
+  frontend:
+    image: ghcr.io/cvijeticc/floor-general-frontend:latest
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NODE_ENV: production
+      # Next (SSR i /api/backend proxy) zove Spring kroz compose mrezu;
+      # browser nikad ne ide direktno na backend.
+      BACKEND_URL: http://backend:8080
+      # Javna adresa sajta: apsolutni og:image (pregled linka profila na Instagramu i
+      # WhatsApp-u), sitemap.xml, robots.txt i schema.org. Glavna adresa od 23.11.2026.
+      # (nginx sve ostalo salje ovde sa 301).
+      SITE_URL: https://www.floorgeneral.rs
+    depends_on:
+      - backend
+    logging: *default_logging

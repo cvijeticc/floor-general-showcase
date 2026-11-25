@@ -1,0 +1,12 @@
+[Unit]
+Description=Dnevni pg_dump Floor General baze
+
+[Timer]
+# 01:30 UTC = pola sata pre EBS snapshot-a (02:20), da se ne preklapaju.
+OnCalendar=*-*-* 01:30:00
+# Ako je masina bila ugasena u to vreme, uradi cim se digne.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

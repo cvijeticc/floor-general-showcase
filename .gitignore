@@ -1,0 +1,18 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+# Napomena: .terraform.lock.hcl NAMERNO ostaje u gitu -- pin verzija provajdera.
+# terraform.tfvars je ovde bez tajni (samo ssh_ingress_cidr) pa takodje ostaje.
+
+# Secreti
+.env
+.env.*
+*.pem
+*.key
+
+# Lokalni alati (IDE, MCP)
+.idea/
+.mcp.json

@@ -1,0 +1,12 @@
+[Unit]
+Description=pg_dump baze Floor General u S3
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fg-pg-dump
+User=root
+# Bez ovoga pad backupa prolazi nezapazeno do trenutka kad zatreba restore.
+StandardOutput=journal
+StandardError=journal
